@@ -1,24 +1,26 @@
 from __future__ import annotations
+import argparse
+import typing
 import numpy as np
 import os
 from math import floor, sqrt
-from PIL import Image
+from statistics import mean
+from PIL import Image, ImageEnhance
 from textwrap import dedent
 
 ASPECT_LEEWAY = 0.9
+COLOR_MAX=255
 DELIMITER=1
+H_MULTIPLIER = 3
 MAX_OUTPUT_HEIGHT = 50
 MAX_OUTPUT_WIDTH = 160
-SMALL_DEFAULT = 10
-MED_DEFAULT = 20
-LRG_DEFAULT = 36
-XLRG_DEFAULT = 75
-COLOR_MAX=255
-TRANSFORM=1
 PRE_COMPUTE=1
+TRANSFORM=1
 
-# compensate for characters being more tall than wide
-H_MULTIPLIER = 3
+SMALL_DEFAULT = 20
+MED_DEFAULT = 36
+LRG_DEFAULT = 65
+XLRG_DEFAULT = 88
 
 class ImageData:
     def __init__(self, image, ascii_dict_len):
@@ -26,23 +28,23 @@ class ImageData:
         self.ascii_dict_len = ascii_dict_len
         self.pre_compute = {}
 
-    def set_sub_image(self, sub_image)->ImageData:
+    def set_sub_image(self, sub_image:np.ndarray)->ImageData:
         self.sub_image = sub_image
         return self
 
-    def set_image(self, image)->ImageData:
+    def set_image(self, image:np.ndarray)->ImageData:
         self.image = image
         return self
 
-    def set_ascii_dict_len(self, ascii_dict_len)->ImageData:
+    def set_ascii_dict_len(self, ascii_dict_len:int)->ImageData:
         self.ascii_dict_len = ascii_dict_len
         return self
 
-    def set_pre_compute(self, pre_compute)->ImageData:
+    def set_pre_compute(self, pre_compute:dict[str,typing.Any])->ImageData:
         self.pre_compute = pre_compute
         return self
 
-    def set_pre_compute_pair(self, kv_pair:tuple[str,object])->dict:
+    def set_pre_compute_pair(self, kv_pair:tuple[str,typing.Any])->dict[str,object]:
         if(len(kv_pair) != 2):
             print("Error setting key/value pair: tuple not of length 2")
         else:
@@ -53,20 +55,39 @@ class ImageData:
         return self.pre_compute[key]
 
 def main():
-    files = (os.listdir('images'))
+    parser = initialize_arg_parser()
+    args = parser.parse_args()
 
-    imglist = input_images(files)
-    imgnum = select_image(imglist)
+    image = Image.Image()
+    if(args.file != None):
+        image = open_image(args.file)
+    else:
+        files = (os.listdir(args.directory))
+        imglist = input_images(files, args.directory)
+        imgnum = select_image(imglist)
+        image = imglist[imgnum]
 
-    output_to_ascii(imglist[imgnum])
+    image = preprocess_image(image)
 
+    output_to_ascii(image, args)
+
+def adjust_to_aspect_ratio(aspect_ratio:float, width:int, height:int)->tuple[int,int]:
+    if(width / height < aspect_ratio):
+        while((width / height < aspect_ratio) and aspect_ratio - width/height > ASPECT_LEEWAY ):
+            height -= 1
+    else:
+        while(width / height > aspect_ratio and width/height - aspect_ratio > ASPECT_LEEWAY):
+            width -= 1
+    return (width,height)
+    
 def decide_classification(image_info:ImageData, 
-                          data_transform, delimiter) -> int:
+                          data_transform: typing.Callable[[ImageData], float], 
+                          delimiter: typing.Callable[[float,ImageData],int]) -> int:
     num = data_transform(image_info)
     ascii_class = delimiter(num, image_info)
     return ascii_class
 
-def determine_image_size(image, size:str = "large"):
+def determine_image_size(image:Image.Image, size:str)->tuple[int, int]:
     height_dict = { "small"  : SMALL_DEFAULT,
                     "medium" : MED_DEFAULT, 
                     "large"  : LRG_DEFAULT,
@@ -75,9 +96,8 @@ def determine_image_size(image, size:str = "large"):
     width, height = image.size
     aspect_ratio = width / height
     
-    if width > MAX_OUTPUT_HEIGHT or height > MAX_OUTPUT_WIDTH:
-        height = height_dict[size]
-        width = int(height * aspect_ratio * H_MULTIPLIER)
+    height = height_dict[size]
+    width = int(height * aspect_ratio * H_MULTIPLIER)
 
     aspect_ratio = width / height
 
@@ -86,25 +106,16 @@ def determine_image_size(image, size:str = "large"):
     if(not validate_size(image.size[1], height)):
         height = (image.size[1] - 1) // 2
 
-    if(width / height < aspect_ratio):
-        print("adjusting height to fit aspect ratio...")
-        while((width / height < aspect_ratio) and aspect_ratio - width/height > ASPECT_LEEWAY ):
-            height -= 1
-    else:
-        print("adjusting width to fit aspect ratio...")
-        while(width / height > aspect_ratio and width/height - aspect_ratio > ASPECT_LEEWAY):
-            width -= 1
+    width, height = adjust_to_aspect_ratio(aspect_ratio, width, height)
 
     return (width,height)
 
-def determine_segment_values(image, segment_list, dict_len):
+def determine_segment_values(image_data:ImageData, 
+                             segment_list:list[tuple[int,int,int,int]])->list[int]:
     segment_key_list = []
-    image_data = ImageData(image, dict_len)
-
-    pre_compute(image_data)
 
     for segment in segment_list:
-        sub_image = image[segment[2]:segment[3], segment[0]:segment[1]]
+        sub_image = image_data.image[segment[2]:segment[3], segment[0]:segment[1]]
         if 0 in sub_image.shape:
             print(dedent(f'''\
             segment: {segment}
@@ -116,21 +127,104 @@ def determine_segment_values(image, segment_list, dict_len):
         segment_key_list.append(sub_image_to_key(image_data))
     return segment_key_list
 
-def input_images(files):
+def initialize_arg_parser()->argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description='Create ascii art from images')
+    parser.add_argument('-n', '--n-chars', 
+                        help="Number of possible characters to be derived from the image",
+                        default=71,
+                        required = False)
+    parser.add_argument('-f', '--file', 
+                        help="Choose an image file directly instead of through the program", 
+                        required = False)
+    parser.add_argument('-d', '--directory', 
+                        help="Choose an image directory to select a possible image from",
+                        default='images/',
+                        required = False)
+    parser.add_argument('-s', '--size', 
+                        help="image size selection from small to xlarge",
+                        default = "large",
+                        required = False)
+    parser.add_argument('-o', '--output',
+                        help="output to a file instead of stdio",
+                        required = False)
+
+    return parser
+
+def initialize_ascii_dict(size:int)->dict[int,str]:
+
+    #ascii_dict = { 0: '%', 1: '#', 2: '@', 3: '+',
+    #               4: '=', 5: '-', 6: ';', 7: ':',
+    #               8: '.', 9: ' ' }
+
+    if(size < 10 or size > 71):
+        print("Invalid dictionary size, exiting program.")
+        quit()
+
+    selection_arr = [ 1, 3, 8, 51, 52, 54, 62, 63, 69, 70 ] 
+    min_size = len(selection_arr)
+
+    ascii_dict = { 0: '$', 1: '@', 2: 'B', 3: '%', 4: '8',
+                   5: '&', 6: 'W', 7: 'M', 8: '#', 9: '*', 
+                   10: 'o', 11: 'a', 12: 'h', 13: 'k', 14: 'b', 
+                   15: 'd', 16: 'p', 17: 'q', 18: 'w', 19: 'm', 
+                   20: 'Z', 21: 'O', 22: '0', 23: 'Q', 24: 'L', 
+                   25: 'C', 26: 'J', 27: 'U', 28: 'Y', 29: 'X', 
+                   30: 'z', 31: 'c', 32: 'v', 33: 'u', 34: 'n', 
+                   35: 'x', 36: 'r', 37: 'j', 38: 'f', 39: 't', 
+                   40: '/', 41: '\\', 42: '|', 43: '(', 44: ')', 
+                   45: '1', 46: '{', 47: '}', 48: '[', 49: ']', 
+                   50: '?', 51: '=', 52: '-', 53: '_', 54: '+', 
+                   55: '~', 56: '<', 57: '>', 58: 'i', 59: '!', 
+                   60: 'l', 61: 'I', 62: ';', 63: ':', 64: ',', 
+                   65: '"', 66: '^', 67: '`', 68: '\'', 69: '.', 
+                   70: ' ' }
+
+    def add_to_selection_arr(s_arr:list[int])->list[int]:
+        diff = []
+        s_arr.insert(0,-1)
+        for x, y in zip(s_arr[0:], s_arr[1:]):
+            diff.append(y-x)
+
+        max = diff[0]
+        max_index = 0
+        for i, num in enumerate(diff):
+            if num > max:
+                max = num
+                max_index = i
+        if max < 2:
+            print("Unable to expand array further, exiting program")
+            quit()
+        s_arr.insert(max_index+1, (s_arr[max_index]+s_arr[max_index+1])//2)
+        s_arr.pop(0)
+        return s_arr
+
+    for _ in range(size-min_size):
+        selection_arr = add_to_selection_arr(selection_arr)
+
+    new_dict = {}
+    for selection in selection_arr:
+        new_dict[selection] = ascii_dict[selection]
+    ascii_dict = {}
+
+    # reset key values to be 0 -> len(dict) - 1
+    for i, value in enumerate(new_dict.values()):
+        ascii_dict[i] = value
+
+    return ascii_dict
+
+# return list of valid imported images from /images directory
+def input_images(files:list, dir:str)->list[Image.Image]:
     imglist = []
     for img_name in files:
-        try:
-            image = Image.open('images/'+img_name)
-            image.name = img_name
-            imglist.append(image)
-        except:
-            print(f'unable to open file {img_name}')
+        image = open_image(dir+img_name)
+        image.name = img_name
+        imglist.append(image)
     return imglist
 
-def n_exclusive_segments(axis_size:int, num_segments:int)->list:
+def n_exclusive_segments(axis_size:int, num_segments:int)->list[tuple[int,int]]:
     seg_list = []
 
-    if (num_segments) > (axis_size + 1)/2:
+    if (not validate_size(axis_size, num_segments)):
         print(dedent(f'''\
             Number of segments too large for axis with too few pixels.  
             ({axis_size}, {num_segments}) Exiting program.'''))
@@ -150,7 +244,7 @@ def n_exclusive_segments(axis_size:int, num_segments:int)->list:
     # evenly distribute the remainder throughout the segments
     remainder_list = []
     middle_index = (num_segments // 2)
-    remainder_list = [middle_index for i in range(leftover)]
+    remainder_list = [middle_index for _ in range(leftover)]
 
     # subtract the distance from the center of the array
     for i in range(leftover):
@@ -161,55 +255,68 @@ def n_exclusive_segments(axis_size:int, num_segments:int)->list:
         endsegment_index:int = previous + pixel_width + 1
         if i in remainder_list:
             endsegment_index += 1
-        temple:tuple = (previous+1, endsegment_index)
+        temple:tuple[int,int] = (previous+1, endsegment_index)
         seg_list.append(temple)
         previous = endsegment_index
         
     return seg_list
 
-def output_to_ascii(image):
-    ascii_dict = { 0: '%',
-                   1: '#', 
-                   2: '@',
-                   3: '+',
-                   4: '=', 
-                   5: '-',
-                   6: ';',
-                   7: ':',
-                   8: '.',
-                   9: ' '
-                  }
+def open_image(file:str)->Image.Image:
+    image = Image.Image()
+    try:
+        image = Image.open(file)
+    except:
+        print(f'unable to open file {str}')
+    return image
 
-    width, height = determine_image_size(image)
+def output_to_ascii(image:Image.Image, args:argparse.Namespace):
+
+    ascii_dict = initialize_ascii_dict(tryparse_int(args.n_chars))
+
+    width, height = determine_image_size(image, args.size)
     segment_list = scan_image(image, width, height)
-    segment_list = validate_list(segment_list, image.size[0], image.size[1])
-    np_arr = np.asarray(image)
+
     if(image.mode == "P"):
          global PRE_COMPUTE
          PRE_COMPUTE = 0
-    segment_key_list = determine_segment_values(np.asarray(image), segment_list, len(ascii_dict))
+
+    image_data = ImageData(np.asarray(image), len(ascii_dict))
+    pre_compute(image_data)
+    segment_key_list = determine_segment_values(image_data, segment_list)
 
     # Palette mode images store color values differently
-    flip_key = lambda key, dict_len: (-key + (dict_len-1)) if image.mode == "P" or image.size[0]>275 else key
+    std_dev = np.mean(image_data.get_pre_compute_by_key("std-dev"))
+    flip_key = lambda key, dict_len: (-key + (dict_len-1)) if image.mode == "P" or std_dev > 65 else key
 
+    output = ""
     index = 0
     while index < width * height:
         key = segment_key_list[index]
         key = flip_key(key, len(ascii_dict))
-        print(ascii_dict[key], end='')
+        output+=ascii_dict[key]
         if((index+1) % width == 0):
-            print()
+            output+="\n"
         index += 1
 
+    if(args.output != None):
+        try:
+            file = open(args.output, 'w')
+            file.write(output)
+            file.close
+        except:
+            print(f"Error writing output to file {args.output}, exiting program")
+            quit()
+    else:
+        print(output)
+
+
 def pre_compute(image_data:ImageData)->ImageData:
-    # check if need to pre-compute any data
-    # default std-dev of r,g,b
     match(PRE_COMPUTE):
         case 1:
             std_dev = [np.std(image_data.image[:,:,i].flatten()) for i in range(3)]
-            image_data.set_pre_compute_pair(("std-dev",std_dev))
         case 0:
             std_dev = np.std(image_data.image)
+    image_data.set_pre_compute_pair(("std-dev",std_dev))
 
     total_mean = np.mean(image_data.image)
 
@@ -241,15 +348,12 @@ def pre_compute(image_data:ImageData)->ImageData:
 
     image_data.set_pre_compute_pair(("delimit_list",delimit_list))
 
-    print(std_dev)
-    print(delimit_list)
     return image_data
 
-def print_imglist(imglist:list):
-    for num, img in enumerate(imglist):
-        print(f'{num}:\t{img.name}\t{img.size}\t{img.mode}')
+def preprocess_image(image:Image.Image)->Image.Image:
+    return image
 
-def scan_image(image, width:int, height:int) -> list:
+def scan_image(image:Image.Image, width:int, height:int) -> list[tuple[int,int,int,int]]:
     image_width, image_height = image.size
     x_segments = n_exclusive_segments(image_width, width)
     y_segments = n_exclusive_segments(image_height, height)
@@ -261,9 +365,11 @@ def scan_image(image, width:int, height:int) -> list:
 
     return segment_list
 
-def select_image(imglist:list)->int:
+def select_image(imglist:list[Image.Image])->int:
     prompt = 'Please select an image to output in ascii: ' 
-    print_imglist(imglist)
+
+    for num, img in enumerate(imglist):
+        print(f'{num}:\t{img.name}\t{img.size}\t{img.mode}')
 
     imgnum = tryparse_int(input(prompt))
     while(imgnum not in range(len(imglist))):
@@ -272,7 +378,7 @@ def select_image(imglist:list)->int:
     return imgnum
 
 def sub_image_to_key(image_data:ImageData)->int:
-    default_transform = lambda image_data : np.mean(image_data.sub_image)
+    default_transform = lambda image_data: np.mean(image_data.sub_image)
     default_delimiter = lambda num, image_data: floor(num / (COLOR_MAX / (image_data.ascii_dict_len - 1)))
 
     match TRANSFORM:
@@ -309,20 +415,6 @@ def tryparse_int(str : str) -> int:
         print('Not a valid integer. Exiting Program.')
         quit()
     return val
-
-def validate_list(segment_list:list, width:int, height:int) -> list:
-    for i in range(0, len(segment_list)):
-        temp = list(segment_list[i])
-        if(temp[0] > width):
-            temp[0] = width
-        if(temp[1] > width):
-            temp[1] = width
-        if(temp[2] > height):
-            temp[2] = height
-        if(temp[3] > height):
-            temp[3] = height
-        segment_list[i] = tuple(temp)
-    return segment_list
 
 def validate_size(axis_size:int, num_segments:int)->bool:
     return not (num_segments) > (axis_size + 1)/2
