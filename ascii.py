@@ -1,20 +1,21 @@
 from __future__ import annotations
 import argparse
 import typing
+import time
+from functools import reduce
 import numpy as np
 import os
-from math import floor, sqrt
-from statistics import mean
-from PIL import Image, ImageEnhance
+from math import floor, ceil, sqrt
+from PIL import Image
 from textwrap import dedent
 
 ASPECT_LEEWAY = 0.9
 COLOR_MAX=255
-DELIMITER=1
+DELIMITER=0
 H_MULTIPLIER = 3
 MAX_OUTPUT_HEIGHT = 50
 MAX_OUTPUT_WIDTH = 160
-PRE_COMPUTE=1
+PRE_COMPUTE=0
 TRANSFORM=1
 
 SMALL_DEFAULT = 20
@@ -58,6 +59,8 @@ def main():
     parser = initialize_arg_parser()
     args = parser.parse_args()
 
+    initialize_globals(args)
+
     image = Image.Image()
     if(args.file != None):
         image = open_image(args.file)
@@ -66,8 +69,6 @@ def main():
         imglist = input_images(files, args.directory)
         imgnum = select_image(imglist)
         image = imglist[imgnum]
-
-    image = preprocess_image(image)
 
     output_to_ascii(image, args)
 
@@ -127,6 +128,48 @@ def determine_segment_values(image_data:ImageData,
         segment_key_list.append(sub_image_to_key(image_data))
     return segment_key_list
 
+def gamma_expansion(np_arr:np.ndarray)->np.ndarray:
+    np_arr = np.where(np_arr <= 0.04045, np_arr / 12.92, ((np_arr+0.055)/1.055)**2.4)
+    return np_arr
+
+def histogram_from_arr(np_arr:np.ndarray, size:int)->np.ndarray:
+    histogram = np.asarray([0 for _ in range(size)])
+    if(len(np_arr.shape)==3):
+        temp_arr = np_arr[:,:,0]
+        row, col, dim = np_arr.shape
+    else:
+        temp_arr = np_arr
+        row, col = np_arr.shape
+    for r in range(row):
+        for c in range(col):
+            temp_arr[r,c] = np.mean(np_arr[r,c])
+            histogram[tryparse_int(temp_arr[r,c]*size-1)] += 1
+    histogram = histogram / (row*col)
+    return histogram
+
+def histogram_normalization(np_arr:np.ndarray)->np.ndarray:
+    histogram = histogram_from_arr(np_arr, COLOR_MAX+1)
+
+    # find first and last nonzero
+    nonzero = [i for i,bool in enumerate(np.where(histogram != 0, True, False)) if bool]
+    if(len(nonzero) > 0):
+        first, last = nonzero[0], nonzero[-1]
+
+        nonzero = nonzero[first:last+1]
+
+        cdf = [reduce(lambda x,y: x+y, histogram[:i]) for i in range(1,COLOR_MAX+2)]
+        #cdf = [np.ceil(x * COLOR_MAX) for x in cdf]
+
+        # histogram normalization algorithm
+        stretch = lambda x: np.asarray([cdf[round(y*COLOR_MAX)] for y in x])
+
+        row,col = np_arr.shape[:2]
+        for r in range(row):
+            for c in range(col):
+                np_arr[r,c,:] = stretch(np_arr[r,c,:])
+
+    return np_arr
+
 def initialize_arg_parser()->argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Create ascii art from images')
     parser.add_argument('-n', '--n-chars', 
@@ -141,25 +184,27 @@ def initialize_arg_parser()->argparse.ArgumentParser:
                         default='images/',
                         required = False)
     parser.add_argument('-s', '--size', 
-                        help="image size selection from small to xlarge",
+                        help="image size selection from [small, medium, large, xlarge]",
                         default = "large",
                         required = False)
     parser.add_argument('-o', '--output',
                         help="output to a file instead of stdio",
                         required = False)
+    parser.add_argument('-dl', '--delimiter',
+                        help="define how image classifications are spread among possible values",
+                        default = 1,
+                        required = False)
+    parser.add_argument('-bg', '--background',
+                        help="output intended for light or dark background",
+                        default = "dark",
+                        required = False)
+    #parser.add_argument('-r', '--range',
+    #                    help="select a range more narrow (<255) in cases of images where the values are too similar in regular use",
+    #                    required = False)
 
     return parser
 
 def initialize_ascii_dict(size:int)->dict[int,str]:
-
-    #ascii_dict = { 0: '%', 1: '#', 2: '@', 3: '+',
-    #               4: '=', 5: '-', 6: ';', 7: ':',
-    #               8: '.', 9: ' ' }
-
-    if(size < 10 or size > 71):
-        print("Invalid dictionary size, exiting program.")
-        quit()
-
     selection_arr = [ 1, 3, 8, 51, 52, 54, 62, 63, 69, 70 ] 
     min_size = len(selection_arr)
 
@@ -179,40 +224,49 @@ def initialize_ascii_dict(size:int)->dict[int,str]:
                    65: '"', 66: '^', 67: '`', 68: '\'', 69: '.', 
                    70: ' ' }
 
-    def add_to_selection_arr(s_arr:list[int])->list[int]:
-        diff = []
-        s_arr.insert(0,-1)
-        for x, y in zip(s_arr[0:], s_arr[1:]):
-            diff.append(y-x)
+    if(size < min_size or size > len(ascii_dict)):
+        print("Invalid dictionary size, exiting program.")
+        quit()
+    elif(size != len(ascii_dict)):
+        def add_to_selection_arr(s_arr:list[int])->list[int]:
+            diff = []
+            s_arr.insert(0,-1)
+            for x, y in zip(s_arr[0:], s_arr[1:]):
+                diff.append(y-x)
 
-        max = diff[0]
-        max_index = 0
-        for i, num in enumerate(diff):
-            if num > max:
-                max = num
-                max_index = i
-        if max < 2:
-            print("Unable to expand array further, exiting program")
-            quit()
-        s_arr.insert(max_index+1, (s_arr[max_index]+s_arr[max_index+1])//2)
-        s_arr.pop(0)
-        return s_arr
+            max = diff[0]
+            max_index = 0
+            for i, num in enumerate(diff):
+                if num > max:
+                    max = num
+                    max_index = i
+            if max < 2:
+                print("Unable to expand array further, exiting program")
+                quit()
+            s_arr.insert(max_index+1, (s_arr[max_index]+s_arr[max_index+1])//2)
+            s_arr.pop(0)
+            return s_arr
 
-    for _ in range(size-min_size):
-        selection_arr = add_to_selection_arr(selection_arr)
+        # interpolate new values to dict selection array
+        for _ in range(size-min_size):
+            selection_arr = add_to_selection_arr(selection_arr)
 
-    new_dict = {}
-    for selection in selection_arr:
-        new_dict[selection] = ascii_dict[selection]
-    ascii_dict = {}
+        new_dict = {}
+        for selection in selection_arr:
+            new_dict[selection] = ascii_dict[selection]
+        ascii_dict = {}
 
-    # reset key values to be 0 -> len(dict) - 1
-    for i, value in enumerate(new_dict.values()):
-        ascii_dict[i] = value
+        # reset key values to be 0 -> len(dict) - 1
+        for i, value in enumerate(new_dict.values()):
+            ascii_dict[i] = value
 
     return ascii_dict
 
-# return list of valid imported images from /images directory
+def initialize_globals(args:argparse.Namespace):
+    if(args.delimiter != None):
+        global DELIMITER
+        DELIMITER = tryparse_int(args.delimiter)
+
 def input_images(files:list, dir:str)->list[Image.Image]:
     imglist = []
     for img_name in files:
@@ -230,8 +284,8 @@ def n_exclusive_segments(axis_size:int, num_segments:int)->list[tuple[int,int]]:
             ({axis_size}, {num_segments}) Exiting program.'''))
         quit()
 
-    pixel_width:int = 1
-    temp:int = 1
+    pixel_width = 1
+    temp = 1
     while((temp*num_segments)+(num_segments - 1) <= axis_size):
         pixel_width = temp
         temp += 1
@@ -252,10 +306,10 @@ def n_exclusive_segments(axis_size:int, num_segments:int)->list[tuple[int,int]]:
 
     previous = -1
     for i in range(num_segments):
-        endsegment_index:int = previous + pixel_width + 1
+        endsegment_index = previous + pixel_width + 1
         if i in remainder_list:
             endsegment_index += 1
-        temple:tuple[int,int] = (previous+1, endsegment_index)
+        temple = (previous+1, endsegment_index)
         seg_list.append(temple)
         previous = endsegment_index
         
@@ -265,28 +319,26 @@ def open_image(file:str)->Image.Image:
     image = Image.Image()
     try:
         image = Image.open(file)
-    except:
+    except OSError:
         print(f'unable to open file {str}')
+    image = image if(image.mode == "RGB") else Image.Image.convert(image, mode="RGB")
     return image
 
 def output_to_ascii(image:Image.Image, args:argparse.Namespace):
-
     ascii_dict = initialize_ascii_dict(tryparse_int(args.n_chars))
+    np_arr:np.ndarray = preprocess_image(np.asarray(image))
+    image_data = ImageData(np_arr, len(ascii_dict))
 
     width, height = determine_image_size(image, args.size)
-    segment_list = scan_image(image, width, height)
+    segment_list = segment_image(image, width, height)
 
-    if(image.mode == "P"):
-         global PRE_COMPUTE
-         PRE_COMPUTE = 0
-
-    image_data = ImageData(np.asarray(image), len(ascii_dict))
     pre_compute(image_data)
     segment_key_list = determine_segment_values(image_data, segment_list)
 
     # Palette mode images store color values differently
     std_dev = np.mean(image_data.get_pre_compute_by_key("std-dev"))
-    flip_key = lambda key, dict_len: (-key + (dict_len-1)) if image.mode == "P" or std_dev > 65 else key
+
+    flip_key = lambda key, dict_len: (-key + (dict_len-1)) if args.background == "dark" else key
 
     output = ""
     index = 0
@@ -300,10 +352,11 @@ def output_to_ascii(image:Image.Image, args:argparse.Namespace):
 
     if(args.output != None):
         try:
+            args.output = os.path.join(os.getcwd(), args.output)
             file = open(args.output, 'w')
             file.write(output)
             file.close
-        except:
+        except OSError:
             print(f"Error writing output to file {args.output}, exiting program")
             quit()
     else:
@@ -312,10 +365,8 @@ def output_to_ascii(image:Image.Image, args:argparse.Namespace):
 
 def pre_compute(image_data:ImageData)->ImageData:
     match(PRE_COMPUTE):
-        case 1:
+        case _:
             std_dev = [np.std(image_data.image[:,:,i].flatten()) for i in range(3)]
-        case 0:
-            std_dev = np.std(image_data.image)
     image_data.set_pre_compute_pair(("std-dev",std_dev))
 
     total_mean = np.mean(image_data.image)
@@ -350,10 +401,29 @@ def pre_compute(image_data:ImageData)->ImageData:
 
     return image_data
 
-def preprocess_image(image:Image.Image)->Image.Image:
+def preprocess_image(image:np.ndarray)->np.ndarray:
+    start = time.time()
+    
+    temp_arr = image / COLOR_MAX
+    
+    temp_arr = gamma_expansion(temp_arr)
+    #linear_approx = lambda rgb: [0.299*rgb[0], 0.587*rgb[1], 0.144*rgb[2]]
+
+    # scalar value between 0 and 1 for interpolation of normalized image 
+    # to increase clarity of image, set above 1.0 (some information will be lost)
+    # TODO: how to decide best scalar? *add default strategy and cmd line option
+    scalar = 0.0
+    hist_arr = histogram_normalization(temp_arr.copy())
+    temp_arr = (temp_arr*(1.0-scalar) + hist_arr*scalar)
+    temp_arr = np.clip(temp_arr,0.0,1.0)
+
+    # TODO: add dithering to compensate for quantization error
+
+    image = temp_arr * COLOR_MAX
+    print(time.time() - start)
     return image
 
-def scan_image(image:Image.Image, width:int, height:int) -> list[tuple[int,int,int,int]]:
+def segment_image(image:Image.Image, width:int, height:int) -> list[tuple[int,int,int,int]]:
     image_width, image_height = image.size
     x_segments = n_exclusive_segments(image_width, width)
     y_segments = n_exclusive_segments(image_height, height)
@@ -411,7 +481,7 @@ def tryparse_int(str : str) -> int:
     val = -1
     try:
         val = int(str)
-    except:
+    except ValueError:
         print('Not a valid integer. Exiting Program.')
         quit()
     return val
