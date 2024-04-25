@@ -78,9 +78,17 @@ def decide_classification(image_info:ImageData)->int:
 
 def determine_image_size(image:Image.Image, size:str)->tuple[int, int]:
     height_dict = { "small"  : SMALL_DEFAULT,
+                    "sm"     : SMALL_DEFAULT,
+                    "s"      : SMALL_DEFAULT,
                     "medium" : MED_DEFAULT, 
+                    "med"    : MED_DEFAULT,
+                    "m"      : MED_DEFAULT,
                     "large"  : LRG_DEFAULT,
-                    "xlarge" : XLRG_DEFAULT }
+                    "lg"     : LRG_DEFAULT,
+                    "l"      : LRG_DEFAULT,
+                    "xlarge" : XLRG_DEFAULT, 
+                    "xlg"    : XLRG_DEFAULT, 
+                    "xl"     : XLRG_DEFAULT }
 
     width, height = image.size
     aspect_ratio = width / height
